@@ -1,4 +1,5 @@
-# netra/core/orchestrator.py
+import time
+from typing import List
 
 from netra.core.context import DomainContext
 from netra.dns.resolver import DNSResolver
@@ -10,147 +11,175 @@ from netra.active.enumerator import ActiveEnumerator
 from netra.intelligence.scorer import AIScorer
 
 from netra.core.correlator import Correlator
-
-from netra.core.correlator import Correlator
 from netra.core.validator import Validator
-
 from netra.output.writer import OutputWriter
 
 
-
-
-
 class Orchestrator:
+    """
+    Central control unit for NETRA
+    """
+
     def __init__(self, context: DomainContext):
         self.context = context
 
-        # DNS Core
+        # DNS core
         self.dns_resolver = DNSResolver()
         self.wildcard_detector = WildcardDetector(self.dns_resolver)
 
-        # Results storage
+        # Unified results store
         self.results = {
             "passive": [],
             "active": [],
             "bruteforce": [],
-            "validated": []
+            "validated": [],
         }
 
+    # ---------- DNS ----------
+
     async def validate_domain(self, domain: str) -> dict:
-        """Central DNS validation point"""
         return await self.dns_resolver.resolve(domain)
 
+    async def validate_domains_batch(self, domains: List[str]) -> list:
+        return await self.dns_resolver.resolve_batch(domains)
+
     async def check_wildcard(self) -> bool:
-        """Check wildcard DNS once per run"""
         return await self.wildcard_detector.has_wildcard(
             self.context.root_domain
         )
 
+    # ---------- Passive ----------
+
     async def run_passive(self):
-        """STEP 0.4 – Passive Recon"""
+        start = time.perf_counter()
         print("[*] Running Passive Recon")
 
         recon = PassiveRecon(self.context.root_domain)
         candidates = recon.run()
 
-        print(f"[*] Passive candidates found: {len(candidates)}")
+        if not candidates:
+            print("[*] No passive candidates found")
+            return
+
+        subdomains = list(set(item["subdomain"] for item in candidates))
+        dns_results = await self.validate_domains_batch(subdomains)
+        dns_map = {r["domain"]: r for r in dns_results if r.get("resolved")}
 
         for item in candidates:
-            sub = item["subdomain"]
-            result = await self.validate_domain(sub)
-
-            if result.get("resolved"):
-                result["source"] = item["source"]
-                result["method"] = item["method"]
+            domain = item["subdomain"]
+            if domain in dns_map:
+                result = dns_map[domain]
+                result.update({
+                    "source": item.get("source"),
+                    "method": item.get("method"),
+                })
                 self.results["passive"].append(result)
 
         self.run_intelligence()
 
+        elapsed = time.perf_counter() - start
+        print(f"[METRIC] Passive recon took {elapsed:.2f}s")
+
+    # ---------- Certificates ----------
+
     async def run_certificates(self):
-        """STEP 0.5 – Certificate Transparency Parsing"""
+        start = time.perf_counter()
         print("[*] Running Certificate Parsing")
 
         parser = CertificateParser(self.context.root_domain)
         candidates = parser.run()
 
-        print(f"[*] Certificate candidates found: {len(candidates)}")
+        if not candidates:
+            print("[*] No certificate candidates found")
+            return
+
+        subdomains = list(set(item["subdomain"] for item in candidates))
+        dns_results = await self.validate_domains_batch(subdomains)
+        dns_map = {r["domain"]: r for r in dns_results if r.get("resolved")}
 
         for item in candidates:
-            sub = item["subdomain"]
-            result = await self.validate_domain(sub)
-
-            if result.get("resolved"):
-                result["source"] = item["source"]
-                result["method"] = item["method"]
+            domain = item["subdomain"]
+            if domain in dns_map:
+                result = dns_map[domain]
+                result.update({
+                    "source": item.get("source"),
+                    "method": item.get("method"),
+                })
                 self.results["passive"].append(result)
 
         self.run_intelligence()
 
+        elapsed = time.perf_counter() - start
+        print(f"[METRIC] Certificate parsing took {elapsed:.2f}s")
+
+    # ---------- Active ----------
+
     async def run_active(self):
-        """STEP 0.6 – Active Enumeration (AI-assisted, DNS-first)"""
+        start = time.perf_counter()
         print("[*] Running Active Enumeration")
 
-        # Skip if wildcard DNS exists
         if await self.check_wildcard():
             print("[!] Wildcard DNS detected — skipping active enum")
             return
 
-        # Use passive intelligence for AI expansion
         known = [r["domain"] for r in self.results["passive"]]
 
         enumerator = ActiveEnumerator(
             self.context.root_domain,
             ai_enabled=self.context.ai_enabled,
-            known_domains=known
+            known_domains=known,
         )
 
         candidates = enumerator.generate_candidates()
+
+        if not candidates:
+            print("[*] No active candidates generated")
+            return
+
         print(f"[*] Active candidates generated: {len(candidates)}")
 
-        for sub in candidates:
-            result = await self.validate_domain(sub)
+        results = await self.validate_domains_batch(candidates)
 
+        for result in results:
             if result.get("resolved"):
-                result["source"] = "wordlist"
-                result["method"] = "active"
+                result.update({
+                    "source": "wordlist",
+                    "method": "active",
+                })
                 self.results["active"].append(result)
 
+        elapsed = time.perf_counter() - start
+        print(f"[METRIC] Active enum took {elapsed:.2f}s")
+
+    # ---------- Intelligence ----------
+
     def run_intelligence(self):
-        """Phase-0 AI scoring layer"""
         scorer = AIScorer()
         self.results["passive"] = scorer.score(self.results["passive"])
 
-    def correlate_results(self):
-        """
-         STEP 0.8 – Correlate & deduplicate all results
-        """
-        correlator = Correlator()
-        return correlator.correlate(self.results)
-    
-    def validate_results(self):
-        """
-        STEP 0.9 – Final validation layer
-        """
-        correlator = Correlator()
-        validator = Validator()
+    # ---------- Correlation ----------
 
-        correlated = correlator.correlate(self.results)
-        validated = validator.validate(correlated)
+    def correlate_results(self) -> list:
+        return Correlator().correlate(self.results)
 
-        return validated
+    # ---------- Validation ----------
+
+    def validate_results(self) -> list:
+        correlated = self.correlate_results()
+        return Validator().validate(correlated)
+
+    # ---------- Output ----------
+
+    def _normalize(self, results: list) -> list:
+        for r in results:
+            r.setdefault("ips", [])
+            r.setdefault("source", None)
+            r.setdefault("method", None)
+            r.setdefault("reason", None)
+        return results
 
     def finalize(self):
-        """
-        STEP 0.10 – Final output & recon memory
-        """
-        validated = self.validate_results()
-
-        writer = OutputWriter(self.context.root_domain)
-        output_file = writer.write_json(validated)
-
+        validated = self._normalize(self.validate_results())
+        output_file = OutputWriter(self.context.root_domain).write_json(validated)
         print(f"[+] Final recon output written to: {output_file}")
-
         return output_file
-
-
-
